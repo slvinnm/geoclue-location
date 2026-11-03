@@ -62,13 +62,19 @@ Run the same installer again to update the command:
 curl -fsSL https://raw.githubusercontent.com/slvinnm/geoclue-location/main/install.sh | bash
 ```
 
-To uninstall the command, run the installer with `--uninstall`:
+Use the dedicated uninstaller:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/slvinnm/geoclue-location/main/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/slvinnm/geoclue-location/main/uninstall.sh | bash
 ```
 
 Or, from a cloned repository:
+
+```bash
+bash uninstall.sh
+```
+
+The same flow is also available through `install.sh --uninstall`:
 
 ```bash
 bash install.sh --uninstall
