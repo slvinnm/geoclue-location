@@ -62,7 +62,7 @@ Run the same installer again to update the command:
 curl -fsSL https://raw.githubusercontent.com/slvinnm/geoclue-location/main/install.sh | bash
 ```
 
-To uninstall the command while leaving GeoClue settings and backups untouched:
+To uninstall the command, run the installer with `--uninstall`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/slvinnm/geoclue-location/main/install.sh | bash -s -- --uninstall
@@ -73,6 +73,10 @@ Or, from a cloned repository:
 ```bash
 bash install.sh --uninstall
 ```
+
+The uninstaller asks for confirmation, then runs `geoclue-location restore` before deleting the command. If restoration fails, the command is kept installed so it remains available for recovery. If a manager drop-in exists but its backup record is missing, uninstallation is stopped rather than risking loss of the original configuration.
+
+When there is no active backup, the uninstaller leaves any existing `/etc/geolocation` file untouched because it cannot prove that the file belongs to this utility. The GeoClue package and archived backups are retained; only the `geoclue-location` command is removed.
 
 ## Notes
 
