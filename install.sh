@@ -7,6 +7,9 @@ readonly REPOSITORY_RAW_URL="https://raw.githubusercontent.com/slvinnm/geoclue-l
 readonly APPLICATION_NAME="geoclue-location"
 readonly DEFAULT_BIN_DIR="/usr/local/bin"
 readonly BACKUP_DIR="/var/lib/geoclue-location-manager/installer-backups"
+readonly STATE_DIR="/var/lib/geoclue-location-manager"
+readonly ACTIVE_BACKUP_FILE="${STATE_DIR}/active-backup"
+readonly MANAGER_DROPIN="/etc/geoclue/conf.d/zzzz-geoclue-location-manager.conf"
 
 BIN_DIR="$DEFAULT_BIN_DIR"
 INSTALL_DEPENDENCIES=1
@@ -110,6 +113,58 @@ is_managed_command() {
     [[ -f "$file" ]] && grep -Fq '# Manage a static GeoClue location on Arch Linux.' "$file"
 }
 
+confirm_uninstall() {
+    local answer
+
+    [[ -r /dev/tty ]] || die "Uninstallation requires an interactive terminal so the restore operation can be confirmed."
+
+    printf 'Uninstalling ${APPLICATION_NAME} will first restore the original GeoClue files from the saved backup, if one exists.\n'
+    printf 'The ${APPLICATION_NAME} command will only be removed after restoration succeeds.\n'
+    read -r -p 'Continue? [y/N]: ' answer </dev/tty
+
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) info "Uninstallation cancelled. No files were changed."; exit 0 ;;
+    esac
+}
+
+restore_before_uninstall() {
+    local target="$1"
+
+    if [[ -s "$ACTIVE_BACKUP_FILE" ]]; then
+        info "An active configuration backup was found."
+        info "Restoring the original /etc/geolocation and GeoClue drop-in before uninstalling..."
+
+        # The application restore command has its own confirmation prompt.
+        # Feed it an affirmative response only after the installer confirmation above.
+        if (( EUID == 0 )); then
+            if ! "$target" restore <<<"y"; then
+                die "Configuration restoration failed. ${APPLICATION_NAME} has been kept installed."
+            fi
+        else
+            command -v sudo >/dev/null 2>&1 || die "sudo is required to restore the original GeoClue configuration."
+            if ! sudo -- "$target" restore <<<"y"; then
+                die "Configuration restoration failed. ${APPLICATION_NAME} has been kept installed."
+            fi
+        fi
+
+        [[ ! -s "$ACTIVE_BACKUP_FILE" ]] || die "The backup is still marked active. Refusing to remove ${APPLICATION_NAME}."
+        success "Original GeoClue configuration restored."
+        return 0
+    fi
+
+    # If the manager drop-in exists without backup metadata, it is not safe to
+    # remove the recovery command: the original contents cannot be reconstructed.
+    if [[ -e "$MANAGER_DROPIN" || -L "$MANAGER_DROPIN" ]]; then
+        die "The manager drop-in exists, but its active-backup record is missing. Refusing to uninstall; restore the backup metadata or recover the configuration manually first."
+    fi
+
+    info "No active backup or manager drop-in was found; there is no saved configuration to restore."
+    if [[ -e /etc/geolocation || -L /etc/geolocation ]]; then
+        warn "/etc/geolocation exists without a backup record and will be left untouched."
+    fi
+}
+
 uninstall_command() {
     local target="${BIN_DIR}/${APPLICATION_NAME}"
 
@@ -120,9 +175,12 @@ uninstall_command() {
 
     is_managed_command "$target" || die "Refusing to remove ${target}: it does not look like this project's command."
 
+    confirm_uninstall
+    restore_before_uninstall "$target"
+
     as_bin_owner rm -f -- "$target"
     success "Removed ${target}."
-    warn "GeoClue configuration and backups were left untouched."
+    info "The GeoClue package and backup archives were left installed/retained."
 }
 
 ensure_geoclue_package() {
