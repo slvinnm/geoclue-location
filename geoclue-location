@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# Manage a static GeoClue location on Arch Linux.
+# Uses /etc/geoclue/conf.d instead of editing the vendor/main geoclue.conf.
+
+set -Eeuo pipefail
+
+readonly GEOLOCATION_FILE="/etc/geolocation"
+readonly GEOCLUE_CONF_DIR="/etc/geoclue/conf.d"
+readonly DROPIN_FILE="${GEOCLUE_CONF_DIR}/zzzz-geoclue-location-manager.conf"
+readonly STATE_DIR="/var/lib/geoclue-location-manager"
+readonly BACKUP_ROOT="${STATE_DIR}/backups"
+readonly ACTIVE_BACKUP_FILE="${STATE_DIR}/active-backup"
+
+PROGRAM_NAME="${0##*/}"
+
+info()  { printf '\033[1;34mINFO\033[0m %s\n' "$*"; }
+success(){ printf '\033[1;32mOK\033[0m   %s\n' "$*"; }
+warn()  { printf '\033[1;33mWARN\033[0m %s\n' "$*" >&2; }
+error() { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; }
+die()   { error "$*"; exit 1; }
+
+usage() {
+    cat <<USAGE
+${PROGRAM_NAME} - interactive static GeoClue location manager
+
+Usage:
+  ${PROGRAM_NAME} [command]
+
+Commands:
+  set       Ask for coordinates, confirm, and apply a static location (default).
+  remove    Remove this tool's static location and override configuration.
+  restore   Restore the files backed up before the first 'set' operation.
+  status    Show the current static-location configuration.
+  help      Show this help.
+
+Examples:
+  ${PROGRAM_NAME}
+  ${PROGRAM_NAME} set
+  ${PROGRAM_NAME} status
+  ${PROGRAM_NAME} remove
+  ${PROGRAM_NAME} restore
+
+The script does not edit /etc/geoclue/geoclue.conf. It uses a GeoClue conf.d
+ drop-in and /etc/geolocation. Existing versions of those two managed paths
+are backed up automatically on the first 'set'. Backups are retained under:
+  ${BACKUP_ROOT}
+USAGE
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null 2>&1 || die "sudo is required. Run this command as root."
+        exec sudo -- "$0" "$@"
+    fi
+}
+
+check_platform() {
+    [[ -f /etc/arch-release ]] || warn "This script is intended for Arch Linux and Arch-based systems."
+    command -v systemctl >/dev/null 2>&1 || die "systemctl was not found."
+    command -v awk >/dev/null 2>&1 || die "awk was not found."
+    command -v install >/dev/null 2>&1 || die "install was not found."
+}
+
+valid_decimal() {
+    [[ "$1" =~ ^-?([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+}
+
+in_range() {
+    local value="$1" min="$2" max="$3"
+    awk -v value="$value" -v min="$min" -v max="$max" \
+        'BEGIN { exit !(value >= min && value <= max) }'
+}
+
+is_positive() {
+    awk -v value="$1" 'BEGIN { exit !(value > 0) }'
+}
+
+prompt_value() {
+    local __result_var="$1" prompt="$2" default_value="${3-}" answer
+    if [[ -n "$default_value" ]]; then
+        read -r -p "$prompt [$default_value]: " answer
+        answer="${answer:-$default_value}"
+    else
+        read -r -p "$prompt: " answer
+    fi
+    printf -v "$__result_var" '%s' "$answer"
+}
+
+backup_one() {
+    local target="$1" key="$2" backup_dir="$3"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a -- "$target" "${backup_dir}/${key}"
+        : > "${backup_dir}/${key}.present"
+    else
+        : > "${backup_dir}/${key}.absent"
+    fi
+}
+
+create_backup_if_needed() {
+    local backup_dir stamp
+
+    if [[ -s "$ACTIVE_BACKUP_FILE" ]]; then
+        backup_dir="$(<"$ACTIVE_BACKUP_FILE")"
+        [[ -d "$backup_dir" ]] || die "The recorded backup directory is missing: $backup_dir"
+        return
+    fi
+
+    install -d -m 700 "$STATE_DIR" "$BACKUP_ROOT"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="${BACKUP_ROOT}/${stamp}-$$"
+    install -d -m 700 "$backup_dir"
+
+    backup_one "$GEOLOCATION_FILE" geolocation "$backup_dir"
+    backup_one "$DROPIN_FILE" dropin "$backup_dir"
+
+    printf '%s\n' "$backup_dir" > "${STATE_DIR}/active-backup.tmp"
+    chmod 600 "${STATE_DIR}/active-backup.tmp"
+    mv -f -- "${STATE_DIR}/active-backup.tmp" "$ACTIVE_BACKUP_FILE"
+    chmod 600 "$ACTIVE_BACKUP_FILE"
+
+    success "Original managed files backed up to: $backup_dir"
+}
+
+write_location_file() {
+    local latitude="$1" longitude="$2" altitude="$3" accuracy="$4"
+    local temp_file
+
+    temp_file="$(mktemp /etc/.geolocation.XXXXXX)"
+    {
+        printf '%s\n' "$latitude"
+        printf '%s\n' "$longitude"
+        printf '%s\n' "$altitude"
+        printf '%s\n' "$accuracy"
+    } > "$temp_file"
+
+    if id geoclue >/dev/null 2>&1; then
+        chown geoclue "$temp_file"
+        chmod 600 "$temp_file"
+    else
+        chmod 600 "$temp_file"
+        warn "The 'geoclue' system user was not found; file ownership remains root."
+    fi
+
+    mv -f -- "$temp_file" "$GEOLOCATION_FILE"
+}
+
+write_dropin() {
+    local temp_file
+
+    install -d -m 755 "$GEOCLUE_CONF_DIR"
+    temp_file="$(mktemp "${GEOCLUE_CONF_DIR}/.geoclue-location-manager.XXXXXX")"
+
+    cat > "$temp_file" <<'CONF'
+# Managed by geoclue-location. Remove this file to restore other providers.
+# Static coordinates are configured in /etc/geolocation.
+
+[ip]
+enable=false
+
+[network-nmea]
+enable=false
+
+[3g]
+enable=false
+
+[cdma]
+enable=false
+
+[modem-gps]
+enable=false
+
+[wifi]
+enable=false
+
+[static-source]
+enable=true
+CONF
+
+    chown root:root "$temp_file"
+    chmod 644 "$temp_file"
+    mv -f -- "$temp_file" "$DROPIN_FILE"
+}
+
+restart_geoclue_if_running() {
+    if systemctl is-active --quiet geoclue.service; then
+        if systemctl restart geoclue.service; then
+            success "GeoClue service restarted."
+        else
+            warn "Could not restart GeoClue. The files were changed; check: systemctl status geoclue.service"
+        fi
+    else
+        info "GeoClue is not currently running; the new configuration will be read on its next D-Bus activation."
+    fi
+}
+
+warn_about_later_dropins() {
+    local current_name="${DROPIN_FILE##*/}" file_name found=0
+    [[ -d "$GEOCLUE_CONF_DIR" ]] || return 0
+
+    while IFS= read -r file_name; do
+        [[ "$file_name" == "$current_name" ]] && continue
+        if [[ "$file_name" > "$current_name" ]]; then
+            warn "${file_name} sorts after this script's override and may override its settings."
+            found=1
+        fi
+    done < <(find "$GEOCLUE_CONF_DIR" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' | LC_ALL=C sort)
+
+    if (( found )); then
+        warn "Review the later files in ${GEOCLUE_CONF_DIR} if the static location is not selected."
+    fi
+}
+
+command_set() {
+    local latitude longitude altitude accuracy answer
+
+    [[ -t 0 ]] || die "Interactive coordinate entry requires a terminal."
+
+    printf '\nGeoClue static location setup\n'
+    printf 'Enter decimal coordinates. South and west values must be negative.\n\n'
+
+    while :; do
+        prompt_value latitude "Latitude (-90 to 90)"
+        if valid_decimal "$latitude" && in_range "$latitude" -90 90; then break; fi
+        warn "Invalid latitude. Enter a decimal number between -90 and 90."
+    done
+
+    while :; do
+        prompt_value longitude "Longitude (-180 to 180)"
+        if valid_decimal "$longitude" && in_range "$longitude" -180 180; then break; fi
+        warn "Invalid longitude. Enter a decimal number between -180 and 180."
+    done
+
+    while :; do
+        prompt_value altitude "Altitude in meters" "0"
+        if valid_decimal "$altitude"; then break; fi
+        warn "Invalid altitude. Enter a decimal number."
+    done
+
+    while :; do
+        prompt_value accuracy "Accuracy radius in meters" "1000"
+        if valid_decimal "$accuracy" && is_positive "$accuracy"; then break; fi
+        warn "Accuracy must be a positive decimal number."
+    done
+
+    printf '\nLocation to apply:\n'
+    printf '  Latitude : %s\n' "$latitude"
+    printf '  Longitude: %s\n' "$longitude"
+    printf '  Altitude : %s m\n' "$altitude"
+    printf '  Accuracy : %s m\n' "$accuracy"
+    printf '\nThis will disable IP, Wi-Fi, modem, 3G/CDMA and Network NMEA providers\n'
+    printf 'through a GeoClue conf.d override, leaving the static source enabled.\n'
+    read -r -p 'Apply this location? [y/N]: ' answer
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) info "Cancelled. No configuration was changed."; return 0 ;;
+    esac
+
+    create_backup_if_needed
+    write_location_file "$latitude" "$longitude" "$altitude" "$accuracy"
+    write_dropin
+    warn_about_later_dropins
+    restart_geoclue_if_running
+
+    success "Static location configured."
+    info "Test it with: /usr/lib/geoclue-2.0/demos/where-am-i"
+    info "Original files can be recovered with: ${PROGRAM_NAME} restore"
+}
+
+read_active_backup() {
+    local backup_dir
+    [[ -s "$ACTIVE_BACKUP_FILE" ]] || die "No active backup was found. Nothing can be safely restored."
+    backup_dir="$(<"$ACTIVE_BACKUP_FILE")"
+    case "$backup_dir" in
+        "${BACKUP_ROOT}/"*) ;;
+        *) die "Invalid backup path recorded in $ACTIVE_BACKUP_FILE" ;;
+    esac
+    [[ -d "$backup_dir" ]] || die "Backup directory does not exist: $backup_dir"
+    printf '%s\n' "$backup_dir"
+}
+
+restore_one() {
+    local backup_dir="$1" key="$2" target="$3" source temp_file target_dir
+
+    if [[ -f "${backup_dir}/${key}.present" ]]; then
+        source="${backup_dir}/${key}"
+        [[ -e "$source" || -L "$source" ]] || die "Backup data is missing: $source"
+        target_dir="$(dirname "$target")"
+        install -d "$target_dir"
+        temp_file="${target_dir}/.${target##*/}.restore.$$"
+        rm -f -- "$temp_file"
+        cp -a -- "$source" "$temp_file"
+        mv -fT -- "$temp_file" "$target"
+    elif [[ -f "${backup_dir}/${key}.absent" ]]; then
+        rm -f -- "$target"
+    else
+        die "Backup metadata is missing for '$key'."
+    fi
+}
+
+command_remove() {
+    local backup_dir answer
+
+    if [[ ! -e "$GEOLOCATION_FILE" && ! -e "$DROPIN_FILE" ]]; then
+        info "No static location file or manager override is currently present."
+        return 0
+    fi
+
+    printf 'This removes the current manual static location and its GeoClue override.\n'
+    printf 'The original files will be backed up first; use "%s restore" to recover them.\n' "$PROGRAM_NAME"
+    read -r -p 'Continue? [y/N]: ' answer
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) info "Cancelled. No files were changed."; return 0 ;;
+    esac
+
+    # Back up any pre-existing files before removing them, even if this tool's set command has never been used on this system.
+    create_backup_if_needed
+    backup_dir="$(read_active_backup)"
+    rm -f -- "$GEOLOCATION_FILE" "$DROPIN_FILE"
+    restart_geoclue_if_running
+    success "Manual static location removed. Backup retained at: $backup_dir"
+}
+
+command_restore() {
+    local backup_dir answer
+    backup_dir="$(read_active_backup)"
+
+    printf 'This restores the original state of:\n'
+    printf '  %s\n' "$GEOLOCATION_FILE" "$DROPIN_FILE"
+    printf 'It does not overwrite /etc/geoclue/geoclue.conf because this script never edits it.\n'
+    read -r -p 'Restore the backed-up files? [y/N]: ' answer
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) info "Cancelled. No files were changed."; return 0 ;;
+    esac
+
+    restore_one "$backup_dir" geolocation "$GEOLOCATION_FILE"
+    restore_one "$backup_dir" dropin "$DROPIN_FILE"
+    rm -f -- "$ACTIVE_BACKUP_FILE"
+    restart_geoclue_if_running
+
+    success "Original managed files restored."
+    info "Backup archive retained at: $backup_dir"
+}
+
+command_status() {
+    printf 'GeoClue static-location manager status\n\n'
+
+    if [[ -f "$GEOLOCATION_FILE" ]]; then
+        printf '%s\n' "Static location file: $GEOLOCATION_FILE"
+        awk 'NF && $1 !~ /^#/ { printf "  %s\n", $0; count++ } END { if (count < 4) print "  WARNING: fewer than four data lines found" }' "$GEOLOCATION_FILE"
+    else
+        printf 'Static location file: not present\n'
+    fi
+
+    if [[ -f "$DROPIN_FILE" ]]; then
+        printf '\nManager override: present (%s)\n' "$DROPIN_FILE"
+        grep -E '^\[|^enable=' "$DROPIN_FILE" || true
+    else
+        printf '\nManager override: not present\n'
+    fi
+
+    if [[ -s "$ACTIVE_BACKUP_FILE" ]]; then
+        printf '\nActive backup: %s\n' "$(<"$ACTIVE_BACKUP_FILE")"
+        printf 'Rollback command: %s restore\n' "$PROGRAM_NAME"
+    else
+        printf '\nActive backup: none\n'
+    fi
+
+    printf '\nGeoClue service: '
+    systemctl is-active geoclue.service 2>/dev/null || true
+}
+
+main() {
+    local command="${1:-set}"
+    case "$command" in
+        help|-h|--help) usage; return 0 ;;
+    esac
+
+    require_root "$@"
+    check_platform
+
+    case "$command" in
+        set) command_set ;;
+        remove) command_remove ;;
+        restore) command_restore ;;
+        status) command_status ;;
+        *) usage >&2; die "Unknown command: $command" ;;
+    esac
+}
+
+main "$@"
