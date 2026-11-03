@@ -34,7 +34,7 @@ Usage:
 Options:
   --bin-dir DIR   Install the command into DIR (default: ${DEFAULT_BIN_DIR}).
   --no-deps       Do not install the GeoClue package when it is missing.
-  --uninstall     Remove the installed command (does not remove GeoClue settings).
+  --uninstall     Restore the saved GeoClue configuration, then remove the command.
   -h, --help      Show this help.
 
 The installer installs only the ${APPLICATION_NAME} command. It does not set
